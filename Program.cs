@@ -364,7 +364,7 @@ static class PodmanBootstrap
             return false;
         }
 
-        (int exitCode, string _, string stderr) result = pm switch
+        (int exitCode, string stdout, string stderr) result = pm switch
         {
             "apt-get" => InstallWithApt("podman"),
             "dnf"     => ProcessExec.WslSh("sudo -n dnf install -y podman", 900),
@@ -760,6 +760,8 @@ static class LinuxCliRunner
 {
     const string ImageName = "wsl-sandbox-mcp-agent:latest";
 
+    static readonly char[] ControlChars = { '\n', '\r', '\0' };
+
     static string Q(string s) => ProcessExec.Q(s);
 
     public record RunResult(
@@ -793,7 +795,7 @@ static class LinuxCliRunner
         if (string.IsNullOrWhiteSpace(cmd))
             return Error("cmd is required.");
 
-        if (cmd.IndexOfAny(new[] { '\n', '\r', '\0' }) >= 0)
+        if (cmd.IndexOfAny(ControlChars) >= 0)
             return Error("cmd must not contain control characters.");
 
         var argsArr  = (arguments?["args"] as JsonArray)
@@ -833,8 +835,12 @@ static class LinuxCliRunner
         var metaRel    = $"out/{toolCallId}.meta.json";
 
         // ── Build podman flags ────────────────────────────────────────────────
+        // Quote key and value separately so an '=' in the value cannot
+        // break the intended key=value structure passed to --env.
         var envFlags = string.Join(" ",
-            extraEnv.Select(kv => $"--env {Q(kv.Key + "=" + kv.Value)}"));
+            extraEnv
+                .Where(kv => !string.IsNullOrEmpty(kv.Key) && !kv.Key.Contains('='))
+                .Select(kv => $"--env {Q(kv.Key)}={Q(kv.Value)}"));
         var argsStr = string.Join(" ", argsArr.Select(Q));
 
         var startedTs = DateTimeOffset.UtcNow;
