@@ -2,10 +2,12 @@
 // All logic lives in this single file.
 //
 // Behaviour summary:
-//   • Exits immediately if WSL is not available.
-//   • Bootstraps a Podman container environment inside WSL on startup.
-//   • Exposes one MCP tool (run_linux_cli) when Podman is ready.
-//   • Reports zero tools if Podman / image bootstrap fails.
+//   • Exits immediately if not running on Windows.
+//   • Always exposes exactly one MCP tool:
+//       - run_linux_cli            when WSL + Podman are fully ready.
+//       - environment_issue_report when any probe or bootstrap step fails;
+//         calling it returns a string describing what went wrong so the user
+//         can diagnose and fix the issue without leaving the chat.
 
 using System;
 using System.Collections.Generic;
@@ -51,42 +53,58 @@ catch (Exception ex)
     return 1;
 }
 
-// ── WSL probe – exit if WSL is not usable ──────────────────────────────────
+// ── WSL probe – capture failure; do NOT exit (always serve a tool) ─────────
+
+string? issueReport = null;
+string  podmanEnv   = "";
+bool    podmanReady = false;
 
 if (!WslProbe.IsWslCallable())
 {
-    Console.Error.WriteLine("[WslContainerMcp] WSL is not available: wsl.exe is not callable.");
-    return 1;
+    issueReport =
+        "WSL_NOT_AVAILABLE: wsl.exe is not callable or returned a non-zero exit code.\n" +
+        "To fix: install WSL via 'wsl --install' or enable it in Windows Features.\n" +
+        "Reference: https://aka.ms/wslinstall";
+    Console.Error.WriteLine($"[WslContainerMcp] {issueReport}");
 }
-
-if (!WslProbe.HasAnyDistro())
+else if (!WslProbe.HasAnyDistro())
 {
-    Console.Error.WriteLine("[WslContainerMcp] WSL has no distro installed.");
-    return 1;
+    issueReport =
+        "WSL_NO_DISTRO: WSL is installed but no Linux distribution is registered.\n" +
+        "To fix: run 'wsl --install' or install a distro from the Microsoft Store.";
+    Console.Error.WriteLine($"[WslContainerMcp] {issueReport}");
 }
-
-if (!WslProbe.CanRunShell())
+else if (!WslProbe.CanRunShell())
 {
-    Console.Error.WriteLine("[WslContainerMcp] WSL shell execution failed.");
-    return 1;
+    issueReport =
+        "WSL_SHELL_FAILED: WSL is present but shell execution failed " +
+        "(wsl -e sh -lc \"echo ok\" did not return 'ok').\n" +
+        "To fix: ensure your default WSL distro is healthy ('wsl --status').";
+    Console.Error.WriteLine($"[WslContainerMcp] {issueReport}");
 }
-
-Console.Error.WriteLine("[WslContainerMcp] WSL is available. Bootstrapping Podman...");
-
-// ── Podman bootstrap – fail gracefully; server continues with 0 tools ────
-
-var (podmanReady, podmanEnv) = await PodmanBootstrap.RunAsync(containerDirWin);
-if (!podmanReady)
-    Console.Error.WriteLine("[WslContainerMcp] Podman not ready; reporting zero tools.");
 else
-    Console.Error.WriteLine("[WslContainerMcp] Podman ready. Starting MCP server.");
+{
+    Console.Error.WriteLine("[WslContainerMcp] WSL is available. Bootstrapping Podman...");
+    string? bootstrapIssue;
+    (podmanReady, podmanEnv, bootstrapIssue) = await PodmanBootstrap.RunAsync(containerDirWin);
+    if (!podmanReady)
+    {
+        issueReport = bootstrapIssue
+            ?? "PODMAN_NOT_READY: Podman bootstrap failed for an unknown reason. Check stderr.";
+        Console.Error.WriteLine($"[WslContainerMcp] Podman not ready: {issueReport}");
+    }
+    else
+    {
+        Console.Error.WriteLine("[WslContainerMcp] Podman ready. Starting MCP server.");
+    }
+}
 
 // ── MCP server loop ────────────────────────────────────────────────────────
 
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
-await McpServer.RunAsync(podmanReady, podmanEnv, workspaceWin, outWin, cts.Token);
+await McpServer.RunAsync(podmanReady, podmanEnv, issueReport, workspaceWin, outWin, cts.Token);
 return 0;
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -252,10 +270,10 @@ static class PodmanBootstrap
 
     static string Q(string s) => ProcessExec.Q(s);
 
-    public static Task<(bool ready, string podmanEnv)> RunAsync(string containerDirWin)
+    public static Task<(bool ready, string podmanEnv, string? issueReport)> RunAsync(string containerDirWin)
         => Task.Run(() => Run(containerDirWin));
 
-    private static (bool ready, string podmanEnv) Run(string containerDirWin)
+    private static (bool ready, string podmanEnv, string? issueReport) Run(string containerDirWin)
     {
         try
         {
@@ -263,8 +281,10 @@ static class PodmanBootstrap
             var home = ProcessExec.WslSh("echo $HOME", 10).stdout.Trim();
             if (string.IsNullOrWhiteSpace(home))
             {
-                Console.Error.WriteLine("[Bootstrap] Cannot resolve $HOME in WSL.");
-                return (false, "");
+                const string msg = "BOOTSTRAP_HOME_MISSING: Could not resolve $HOME inside WSL. " +
+                                   "Ensure your WSL distro has a properly configured user home directory.";
+                Console.Error.WriteLine($"[Bootstrap] {msg}");
+                return (false, "", msg);
             }
 
             // 2. Create stable storage directories inside WSL
@@ -277,8 +297,10 @@ static class PodmanBootstrap
                 $"mkdir -p {Q(baseDir)} {Q(graphRoot)} {Q(runRoot)}", 30);
             if (mkdirs.exitCode != 0)
             {
-                Console.Error.WriteLine($"[Bootstrap] mkdir failed: {mkdirs.stderr.Trim()}");
-                return (false, "");
+                var msg = $"BOOTSTRAP_MKDIR_FAILED: Could not create required directories inside WSL.\n" +
+                          $"Details: {mkdirs.stderr.Trim()}";
+                Console.Error.WriteLine($"[Bootstrap] {msg}");
+                return (false, "", msg);
             }
 
             // 3. Write storage.conf
@@ -290,8 +312,10 @@ static class PodmanBootstrap
 
             if (!WriteToWsl(storageConf, confContent))
             {
-                Console.Error.WriteLine("[Bootstrap] Failed to write storage.conf in WSL.");
-                return (false, "");
+                const string msg = "BOOTSTRAP_STORAGE_CONF_FAILED: Failed to write storage.conf inside WSL. " +
+                                   "Ensure python3 or base64 is available in your WSL distro.";
+                Console.Error.WriteLine($"[Bootstrap] {msg}");
+                return (false, "", msg);
             }
 
             var podmanEnv = $"CONTAINERS_STORAGE_CONF={Q(storageConf)}";
@@ -300,67 +324,81 @@ static class PodmanBootstrap
             if (!CommandExistsInWsl("podman"))
             {
                 Console.Error.WriteLine("[Bootstrap] podman not found; attempting non-interactive install...");
-                if (!TryInstallPodman())
+                if (!TryInstallPodman(out var installMsg))
                 {
-                    Console.Error.WriteLine("[Bootstrap] Podman install failed.");
-                    return (false, podmanEnv);
+                    Console.Error.WriteLine($"[Bootstrap] Podman install failed: {installMsg}");
+                    return (false, podmanEnv, installMsg);
                 }
             }
 
             if (ProcessExec.WslSh($"{podmanEnv} podman --version", 10).exitCode != 0)
             {
-                Console.Error.WriteLine("[Bootstrap] podman --version failed.");
-                return (false, podmanEnv);
+                const string msg = "PODMAN_VERSION_FAILED: 'podman --version' failed inside WSL. " +
+                                   "Podman may be installed but not functional. Try running it manually.";
+                Console.Error.WriteLine($"[Bootstrap] {msg}");
+                return (false, podmanEnv, msg);
             }
 
-            if (ProcessExec.WslSh($"{podmanEnv} podman info", 30).exitCode != 0)
+            var podmanInfo = ProcessExec.WslSh($"{podmanEnv} podman info", 30);
+            if (podmanInfo.exitCode != 0)
             {
-                Console.Error.WriteLine("[Bootstrap] podman info failed.");
-                return (false, podmanEnv);
+                var msg = "PODMAN_INFO_FAILED: 'podman info' failed inside WSL. " +
+                          "This often indicates a missing kernel feature (e.g. cgroups v2) or user namespace issue.\n" +
+                          $"Details: {podmanInfo.stderr.Trim()}";
+                Console.Error.WriteLine($"[Bootstrap] {msg}");
+                return (false, podmanEnv, msg);
             }
 
             // 5. Ensure agent image exists
             if (ProcessExec.WslSh($"{podmanEnv} podman image exists {Q(ImageName)}", 10).exitCode != 0)
             {
                 Console.Error.WriteLine($"[Bootstrap] Image {ImageName} missing; building...");
-                if (!BuildImage(podmanEnv, containerDirWin))
+                if (!BuildImage(podmanEnv, containerDirWin, out var buildMsg))
                 {
-                    Console.Error.WriteLine("[Bootstrap] Image build failed.");
-                    return (false, podmanEnv);
+                    Console.Error.WriteLine($"[Bootstrap] Image build failed: {buildMsg}");
+                    return (false, podmanEnv, buildMsg);
                 }
                 if (ProcessExec.WslSh($"{podmanEnv} podman image exists {Q(ImageName)}", 10).exitCode != 0)
                 {
-                    Console.Error.WriteLine("[Bootstrap] Image still missing after build.");
-                    return (false, podmanEnv);
+                    const string msg = "IMAGE_STILL_MISSING: Image build appeared to succeed but " +
+                                       $"'{ImageName}' is still not listed by Podman. Check your Podman storage config.";
+                    Console.Error.WriteLine($"[Bootstrap] {msg}");
+                    return (false, podmanEnv, msg);
                 }
             }
 
             Console.Error.WriteLine("[Bootstrap] All checks passed.");
-            return (true, podmanEnv);
+            return (true, podmanEnv, null);
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[Bootstrap] Exception: {ex.Message}");
-            return (false, "");
+            var exMsg = $"BOOTSTRAP_EXCEPTION: Unexpected error during bootstrap: {ex.Message}";
+            return (false, "", exMsg);
         }
     }
 
     private static bool CommandExistsInWsl(string name)
         => ProcessExec.WslSh($"command -v {Q(name)} >/dev/null 2>&1", 10).exitCode == 0;
 
-    private static bool TryInstallPodman()
+    private static bool TryInstallPodman(out string issueMsg)
     {
         // Only attempt non-interactive install (sudo -n)
         if (ProcessExec.WslSh("sudo -n true", 10).exitCode != 0)
         {
-            Console.Error.WriteLine("[Bootstrap] sudo -n requires a password; cannot install Podman non-interactively.");
+            issueMsg = "SUDO_NOT_NONINTERACTIVE: 'sudo -n true' failed inside WSL. " +
+                       "Podman is not installed and it cannot be installed non-interactively without passwordless sudo. " +
+                       "Either install Podman manually ('sudo apt-get install -y podman') or configure passwordless sudo.";
+            Console.Error.WriteLine($"[Bootstrap] {issueMsg}");
             return false;
         }
 
         var pm = DetectPackageManager();
         if (string.IsNullOrEmpty(pm))
         {
-            Console.Error.WriteLine("[Bootstrap] No supported package manager found (apt-get / dnf / apk).");
+            issueMsg = "PKG_MANAGER_MISSING: No supported package manager found (apt-get / dnf / apk) inside WSL. " +
+                       "Install Podman manually and restart the server.";
+            Console.Error.WriteLine($"[Bootstrap] {issueMsg}");
             return false;
         }
 
@@ -374,9 +412,13 @@ static class PodmanBootstrap
 
         if (result.exitCode != 0)
         {
+            issueMsg = $"PODMAN_INSTALL_FAILED: Package installation of Podman failed via {pm}.\n" +
+                       $"Details: {result.stderr?.Trim()}\n" +
+                       "Try installing Podman manually inside WSL and then restart the server.";
             Console.Error.WriteLine($"[Bootstrap] Package install failed: {result.stderr?.Trim()}");
             return false;
         }
+        issueMsg = ""; // required by compiler: out parameter must be assigned on all paths
         return true;
     }
 
@@ -395,18 +437,27 @@ static class PodmanBootstrap
         return "";
     }
 
-    private static bool BuildImage(string podmanEnv, string containerDirWin)
+    private static bool BuildImage(string podmanEnv, string containerDirWin, out string issueMsg)
     {
         var wslPath = PathMapping.ToWslPath(containerDirWin);
         if (string.IsNullOrWhiteSpace(wslPath))
         {
-            Console.Error.WriteLine("[Bootstrap] Cannot map container dir to WSL path.");
+            issueMsg = "IMAGE_PATH_FAILED: Cannot map the container directory to a WSL /mnt/... path. " +
+                       "Ensure the workspace is on a drive letter path (e.g. C:\\...).";
+            Console.Error.WriteLine($"[Bootstrap] {issueMsg}");
             return false;
         }
         var r = ProcessExec.WslSh($"{podmanEnv} podman build -t {Q(ImageName)} {Q(wslPath)}", 900);
         if (r.exitCode != 0)
+        {
+            issueMsg = $"IMAGE_BUILD_FAILED: 'podman build' for {ImageName} failed.\n" +
+                       $"Details: {r.stderr?.Trim()}\n" +
+                       $"Check the Dockerfile at: {containerDirWin}";
             Console.Error.WriteLine($"[Bootstrap] Build error: {r.stderr?.Trim()}");
-        return r.exitCode == 0;
+            return false;
+        }
+        issueMsg = ""; // required by compiler: out parameter must be assigned on all paths
+        return true;
     }
 
     /// <summary>
@@ -482,17 +533,21 @@ static class McpServer
     static readonly JsonSerializerOptions CompactJson = new() { WriteIndented = false };
 
     public static async Task RunAsync(
-        bool   podmanReady,
-        string podmanEnv,
-        string workspaceWin,
-        string outWin,
+        bool      podmanReady,
+        string    podmanEnv,
+        string?   issueReport,
+        string    workspaceWin,
+        string    outWin,
         CancellationToken ct)
     {
         using var reader = new StreamReader(Console.OpenStandardInput(),  new UTF8Encoding(false));
         using var writer = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false))
             { AutoFlush = true };
 
-        Console.Error.WriteLine($"[McpServer] Ready (tools available: {(podmanReady ? 1 : 0)})");
+        Console.Error.WriteLine(
+            podmanReady
+                ? "[McpServer] Ready (tool: run_linux_cli)"
+                : "[McpServer] Ready (tool: environment_issue_report)");
 
         while (!ct.IsCancellationRequested)
         {
@@ -541,13 +596,13 @@ static class McpServer
                         break;
 
                     case "tools/list":
-                        await HandleToolsList(writer, id, podmanReady).ConfigureAwait(false);
+                        await HandleToolsList(writer, id, podmanReady, issueReport).ConfigureAwait(false);
                         break;
 
                     case "tools/call":
                         await HandleToolsCall(
                             writer, id, msg["params"],
-                            podmanReady, podmanEnv, workspaceWin, outWin, ct)
+                            podmanReady, podmanEnv, issueReport, workspaceWin, outWin, ct)
                             .ConfigureAwait(false);
                         break;
 
@@ -585,10 +640,13 @@ static class McpServer
             },
         });
 
-    static Task HandleToolsList(StreamWriter w, JsonNode id, bool podmanReady)
+    static Task HandleToolsList(StreamWriter w, JsonNode id, bool podmanReady, string? issueReport)
     {
         var tools = new JsonArray();
-        if (podmanReady) tools.Add(BuildRunLinuxCliDefinition());
+        if (podmanReady)
+            tools.Add(BuildRunLinuxCliDefinition());
+        else
+            tools.Add(BuildEnvironmentIssueReportDefinition());
         return WriteResult(w, id, new JsonObject { ["tools"] = tools });
     }
 
@@ -598,11 +656,27 @@ static class McpServer
         JsonNode?         @params,
         bool              podmanReady,
         string            podmanEnv,
+        string?           issueReport,
         string            workspaceWin,
         string            outWin,
         CancellationToken ct)
     {
         var toolName = @params?["name"]?.GetValue<string>();
+
+        if (toolName == "environment_issue_report")
+        {
+            var report = issueReport ?? "No issue detected; the environment appears to be healthy.";
+            await WriteResult(w, id, new JsonObject
+            {
+                ["content"] = new JsonArray
+                {
+                    new JsonObject { ["type"] = "text", ["text"] = report }
+                },
+                ["isError"] = false,
+            }).ConfigureAwait(false);
+            return;
+        }
+
         if (toolName != "run_linux_cli")
         {
             await WriteError(w, id, -32601, $"Tool not found: {toolName}").ConfigureAwait(false);
@@ -611,6 +685,8 @@ static class McpServer
 
         if (!podmanReady)
         {
+            // run_linux_cli was explicitly called but environment is not ready.
+            var report = issueReport ?? "Podman is not ready.";
             await WriteResult(w, id, new JsonObject
             {
                 ["content"] = new JsonArray
@@ -618,7 +694,7 @@ static class McpServer
                     new JsonObject
                     {
                         ["type"] = "text",
-                        ["text"] = "Tool run_linux_cli is not available: Podman is not ready.",
+                        ["text"] = $"Tool run_linux_cli is not available.\n{report}",
                     }
                 },
                 ["isError"] = true,
@@ -655,7 +731,7 @@ static class McpServer
         await WriteResult(w, id, resultJson).ConfigureAwait(false);
     }
 
-    // ── Tool definition ───────────────────────────────────────────────────────
+    // ── Tool definitions ──────────────────────────────────────────────────────
 
     static JsonObject BuildRunLinuxCliDefinition() => new()
     {
@@ -698,6 +774,24 @@ static class McpServer
                 },
             },
             ["required"] = new JsonArray { "cmd", "args" },
+        },
+    };
+
+    /// <summary>
+    /// Exposed in place of run_linux_cli when the environment is not ready.
+    /// Calling it returns a human-readable description of the failure so the
+    /// user can diagnose and fix the problem without leaving their AI chat.
+    /// </summary>
+    static JsonObject BuildEnvironmentIssueReportDefinition() => new()
+    {
+        ["name"]        = "environment_issue_report",
+        ["description"] = "Returns a description of why the Linux container environment " +
+                          "is not available. Call this to find out what needs to be fixed " +
+                          "(e.g. WSL not installed, Podman missing, image build failed).",
+        ["inputSchema"] = new JsonObject
+        {
+            ["type"]       = "object",
+            ["properties"] = new JsonObject(),   // no inputs
         },
     };
 
