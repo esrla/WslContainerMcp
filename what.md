@@ -143,3 +143,37 @@ Deliverables
 - Full compilable C# project as described.
 - Dockerfile for the agent image.
 - README.txt with inspection instructions for Mode A and Mode B.
+
+
+
+Example of Program.exe that exits if wsl is not available:
+
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+
+public class Program
+{
+    public static async Task Main(string[] args)
+    {
+        if (!HasWsl())
+            return;
+
+        var builder = Host.CreateApplicationBuilder(args);
+        builder.Logging.AddConsole(consoleLogOptions =>
+        {
+            // Configure all logs to go to stderr
+            consoleLogOptions.LogToStandardErrorThreshold = Microsoft.Extensions.Logging.LogLevel.Trace;
+        });
+
+        //var runtimeTools = await GraphServer.ToolsFromClass.GetToolsAsync().ConfigureAwait(false);
+
+        builder.Services
+            .AddMcpServer()
+            .WithStdioServerTransport()
+            .WithToolsFromAssembly();
+            //.WithTools(runtimeTools);
+
+        await builder.Build().RunAsync();
+    }
+}
