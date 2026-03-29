@@ -1,3 +1,4 @@
+using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 
@@ -5,18 +6,21 @@ namespace WslContainerMcp.Runtime;
 
 /// <summary>
 /// Configures the Podman storage layout inside WSL, installs Podman if missing,
-/// and ensures the agent container image is present.
+/// builds the agent image, and ensures the persistent Linux container is running.
 /// </summary>
 internal static class PodmanBootstrap
 {
-    private const string ImageName = "wsl-sandbox-mcp-agent:latest";
+    private const string ImageName     = "wsl-sandbox-mcp-agent:latest";
+    private const string ContainerName = "wsl-sandbox-mcp-persistent";
 
     private static string Q(string s) => ProcessExec.Q(s);
 
-    public static Task<(bool ready, string podmanEnv, string? issueReport)> RunAsync(string containerDirWin)
-        => Task.Run(() => Run(containerDirWin));
+    public static Task<(bool ready, string podmanEnv, string containerName, string? issueReport)>
+        RunAsync(string containerDirWin, string linuxContainerWin, bool allowNetwork)
+        => Task.Run(() => Run(containerDirWin, linuxContainerWin, allowNetwork));
 
-    private static (bool ready, string podmanEnv, string? issueReport) Run(string containerDirWin)
+    private static (bool ready, string podmanEnv, string containerName, string? issueReport)
+        Run(string containerDirWin, string linuxContainerWin, bool allowNetwork)
     {
         try
         {
@@ -33,7 +37,7 @@ internal static class PodmanBootstrap
                     "  3. Verify your home directory: echo $HOME\n" +
                     "  4. Start this server again.";
                 Console.Error.WriteLine($"[Bootstrap] {msg}");
-                return (false, "", msg);
+                return (false, "", "", msg);
             }
 
             // 2. Create stable storage directories inside WSL
@@ -53,7 +57,7 @@ internal static class PodmanBootstrap
                     $"  1. Open a WSL terminal and run: mkdir -p {baseDir}/podman/graphroot {baseDir}/podman/runroot\n" +
                     "  2. Start this server again.";
                 Console.Error.WriteLine($"[Bootstrap] {msg}");
-                return (false, "", msg);
+                return (false, "", "", msg);
             }
 
             // 3. Write storage.conf (Mode A: stable per-user Podman storage path)
@@ -72,7 +76,7 @@ internal static class PodmanBootstrap
                     "  1. Open a WSL terminal and run: sudo apt-get install -y coreutils\n" +
                     "  2. Start this server again.";
                 Console.Error.WriteLine($"[Bootstrap] {msg}");
-                return (false, "", msg);
+                return (false, "", "", msg);
             }
 
             var podmanEnv = $"CONTAINERS_STORAGE_CONF={Q(storageConf)}";
@@ -84,7 +88,7 @@ internal static class PodmanBootstrap
                 if (!TryInstallPodman(out var installMsg))
                 {
                     Console.Error.WriteLine($"[Bootstrap] Podman install failed: {installMsg}");
-                    return (false, podmanEnv, installMsg);
+                    return (false, podmanEnv, "", installMsg);
                 }
             }
 
@@ -98,7 +102,7 @@ internal static class PodmanBootstrap
                     "  2. If it fails, try reinstalling: sudo apt-get install --reinstall podman\n" +
                     "  3. Start this server again.";
                 Console.Error.WriteLine($"[Bootstrap] {msg}");
-                return (false, podmanEnv, msg);
+                return (false, podmanEnv, "", msg);
             }
 
             var podmanInfo = ProcessExec.WslSh($"{podmanEnv} podman info", 30);
@@ -114,7 +118,7 @@ internal static class PodmanBootstrap
                     "  3. If you see 'cgroup' errors, update your WSL kernel: wsl --update\n" +
                     "  4. Start this server again.";
                 Console.Error.WriteLine($"[Bootstrap] {msg}");
-                return (false, podmanEnv, msg);
+                return (false, podmanEnv, "", msg);
             }
 
             // 5. Ensure agent image exists
@@ -124,7 +128,7 @@ internal static class PodmanBootstrap
                 if (!BuildImage(podmanEnv, containerDirWin, out var buildMsg))
                 {
                     Console.Error.WriteLine($"[Bootstrap] Image build failed: {buildMsg}");
-                    return (false, podmanEnv, buildMsg);
+                    return (false, podmanEnv, "", buildMsg);
                 }
                 if (ProcessExec.WslSh($"{podmanEnv} podman image exists {Q(ImageName)}", 10).exitCode != 0)
                 {
@@ -137,12 +141,22 @@ internal static class PodmanBootstrap
                         $"     cat ~/.wsl-sandbox-mcp/storage.conf\n" +
                         "  3. Start this server again.";
                     Console.Error.WriteLine($"[Bootstrap] {msg}");
-                    return (false, podmanEnv, msg);
+                    return (false, podmanEnv, "", msg);
                 }
             }
 
+            // 6. Ensure the persistent container exists and is running.
+            //    The container bind-mounts linux-container/workspace → /workspace and
+            //    linux-container/home → /home so the full user environment is visible
+            //    from Windows at %USERPROFILE%\.wsl-sandbox-mcp\linux-container\.
+            if (!EnsurePersistentContainer(podmanEnv, linuxContainerWin, allowNetwork, out var containerMsg))
+            {
+                Console.Error.WriteLine($"[Bootstrap] Persistent container setup failed: {containerMsg}");
+                return (false, podmanEnv, "", containerMsg);
+            }
+
             Console.Error.WriteLine("[Bootstrap] All checks passed.");
-            return (true, podmanEnv, null);
+            return (true, podmanEnv, ContainerName, null);
         }
         catch (Exception ex)
         {
@@ -151,12 +165,130 @@ internal static class PodmanBootstrap
                 "❌ An unexpected error occurred during environment setup.\n\n" +
                 $"Error: {ex.Message}\n\n" +
                 "Please check the server's error output for details and try starting again.";
-            return (false, "", exMsg);
+            return (false, "", "", exMsg);
         }
     }
 
     private static bool CommandExistsInWsl(string name)
         => ProcessExec.WslSh($"command -v {Q(name)} >/dev/null 2>&1", 10).exitCode == 0;
+
+    /// <summary>
+    /// Ensures the persistent container <see cref="ContainerName"/> exists and is running.
+    /// <para>
+    /// On first run the container is created with two bind mounts so that the Linux environment
+    /// is fully user-inspectable from Windows:
+    /// <list type="bullet">
+    ///   <item><c>linux-container/workspace</c> → <c>/workspace</c> — project files</item>
+    ///   <item><c>linux-container/home</c>      → <c>/home</c>      — user home directories</item>
+    /// </list>
+    /// These subdirectories of the Windows-side <c>linux-container</c> folder persist across
+    /// server restarts and container restarts. Packages installed with <c>apt</c> / other package
+    /// managers live inside the container's overlay layer (Podman graphroot) and also persist as
+    /// long as the container is not removed.
+    /// </para>
+    /// <para>
+    /// <b>Changing <c>--no-network</c>:</b> The network flag is applied only when the container is
+    /// first created. To change it, remove the container manually
+    /// (<c>podman rm -f wsl-sandbox-mcp-persistent</c>) and restart the server.
+    /// </para>
+    /// </summary>
+    private static bool EnsurePersistentContainer(
+        string podmanEnv, string linuxContainerWin, bool allowNetwork, out string issueMsg)
+    {
+        // Check whether the container already exists
+        var inspectResult = ProcessExec.WslSh(
+            $"{podmanEnv} podman inspect --format {Q("{{.State.Status}}")} {Q(ContainerName)}",
+            15);
+
+        if (inspectResult.exitCode == 0)
+        {
+            var status = inspectResult.stdout.Trim();
+            if (status == "running")
+            {
+                Console.Error.WriteLine($"[Bootstrap] Persistent container '{ContainerName}' is already running.");
+                issueMsg = "";
+                return true;
+            }
+
+            // Container exists but is not running — try to start it.
+            Console.Error.WriteLine($"[Bootstrap] Persistent container '{ContainerName}' exists (status: {status}); starting...");
+            var startResult = ProcessExec.WslSh($"{podmanEnv} podman start {Q(ContainerName)}", 30);
+            if (startResult.exitCode == 0)
+            {
+                Console.Error.WriteLine($"[Bootstrap] Persistent container '{ContainerName}' started.");
+                issueMsg = "";
+                return true;
+            }
+
+            // Start failed — remove the container and recreate it below.
+            Console.Error.WriteLine($"[Bootstrap] Could not start existing container: {startResult.stderr.Trim()}. Removing and recreating...");
+            ProcessExec.WslSh($"{podmanEnv} podman rm -f {Q(ContainerName)}", 15);
+        }
+
+        // Map the Windows-side linux-container subdirectories to WSL paths.
+        var wslWorkspace = PathMapping.ToWslPath(Path.Combine(linuxContainerWin, "workspace"));
+        var wslHome      = PathMapping.ToWslPath(Path.Combine(linuxContainerWin, "home"));
+
+        if (string.IsNullOrWhiteSpace(wslWorkspace) || string.IsNullOrWhiteSpace(wslHome))
+        {
+            issueMsg =
+                "❌ Cannot map the linux-container directories to WSL /mnt/... paths.\n\n" +
+                "This usually means the server is not running from a standard Windows drive (e.g. C:\\).\n\n" +
+                "To fix:\n" +
+                "  • Ensure this server is run from a drive-letter path.\n" +
+                "  • UNC paths (\\\\server\\share\\) are not supported.";
+            Console.Error.WriteLine($"[Bootstrap] Path mapping failed for: {linuxContainerWin}");
+            return false;
+        }
+
+        // Create and start the persistent container.
+        var networkFlag = allowNetwork ? "" : "--network none";
+        var createParts = new[]
+        {
+            podmanEnv,
+            "podman create",
+            $"--name {Q(ContainerName)}",
+            networkFlag,
+            $"-v {Q(wslWorkspace + ":/workspace:rw")}",
+            $"-v {Q(wslHome + ":/home:rw")}",
+            Q(ImageName),
+            "sleep infinity",
+        };
+        var createScript = string.Join(" ", createParts.Where(p => !string.IsNullOrEmpty(p))).Trim();
+
+        Console.Error.WriteLine($"[Bootstrap] Creating persistent container '{ContainerName}'...");
+        var createResult = ProcessExec.WslSh(createScript, 30);
+        if (createResult.exitCode != 0)
+        {
+            issueMsg =
+                $"❌ Failed to create the persistent container '{ContainerName}'.\n\n" +
+                $"Error details: {createResult.stderr.Trim()}\n\n" +
+                "To fix:\n" +
+                $"  1. Open a WSL terminal and run: podman ps -a\n" +
+                $"  2. If a stale container exists, remove it: podman rm -f {ContainerName}\n" +
+                "  3. Start this server again.";
+            Console.Error.WriteLine($"[Bootstrap] Create failed: {createResult.stderr.Trim()}");
+            return false;
+        }
+
+        Console.Error.WriteLine($"[Bootstrap] Starting persistent container '{ContainerName}'...");
+        var startResult2 = ProcessExec.WslSh($"{podmanEnv} podman start {Q(ContainerName)}", 30);
+        if (startResult2.exitCode != 0)
+        {
+            issueMsg =
+                $"❌ Failed to start the persistent container '{ContainerName}'.\n\n" +
+                $"Error details: {startResult2.stderr.Trim()}\n\n" +
+                "To fix:\n" +
+                $"  1. Open a WSL terminal and run: podman start {ContainerName}\n" +
+                "  2. If it fails, check Podman logs and restart this server.";
+            Console.Error.WriteLine($"[Bootstrap] Start failed: {startResult2.stderr.Trim()}");
+            return false;
+        }
+
+        Console.Error.WriteLine($"[Bootstrap] Persistent container '{ContainerName}' is running.");
+        issueMsg = "";
+        return true;
+    }
 
     private static bool TryInstallPodman(out string issueMsg)
     {
