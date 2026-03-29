@@ -11,13 +11,24 @@ using WslContainerMcp.Tools;
 
 bool allowNetwork = !args.Contains("--no-network", StringComparer.OrdinalIgnoreCase);
 
-// ── Workspace setup ───────────────────────────────────────────────────────────
+// ── Directory setup ───────────────────────────────────────────────────────────
+//
+// Layout under %USERPROFILE%\.wsl-sandbox-mcp\:
+//
+//   linux-container\          ← full persistent Linux environment (user-browsable)
+//     workspace\              ← bind-mounted as /workspace inside the container
+//     home\                   ← bind-mounted as /home inside the container
+//     out\                    ← per-call metadata JSON files
+//   container\
+//     Dockerfile              ← auto-extracted; used to build the agent image
 
-var userProfile     = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-var rootWin         = Path.Combine(userProfile, ".wsl-sandbox-mcp");
-var workspaceWin    = Path.Combine(rootWin, "workspace");
-var outWin          = Path.Combine(workspaceWin, "out");
-var containerDirWin = Path.Combine(rootWin, "container");
+var userProfile          = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+var rootWin              = Path.Combine(userProfile, ".wsl-sandbox-mcp");
+var linuxContainerWin    = Path.Combine(rootWin, "linux-container");
+var workspaceWin         = Path.Combine(linuxContainerWin, "workspace");
+var homeWin              = Path.Combine(linuxContainerWin, "home");
+var outWin               = Path.Combine(linuxContainerWin, "out");
+var containerDirWin      = Path.Combine(rootWin, "container");
 
 string? issueReport = null;
 
@@ -33,6 +44,8 @@ else
 {
     try
     {
+        Directory.CreateDirectory(workspaceWin);
+        Directory.CreateDirectory(homeWin);
         Directory.CreateDirectory(outWin);
         Directory.CreateDirectory(containerDirWin);
 
@@ -43,9 +56,9 @@ else
     }
     catch (Exception ex)
     {
-        Console.Error.WriteLine($"[WslContainerMcp] Failed to create workspace dirs: {ex.Message}");
+        Console.Error.WriteLine($"[WslContainerMcp] Failed to create directories: {ex.Message}");
         issueReport =
-            "❌ Failed to create the server workspace directories.\n\n" +
+            "❌ Failed to create the server directories.\n\n" +
             $"Error: {ex.Message}\n\n" +
             "To fix:\n" +
             $"  • Ensure write access to: {rootWin}\n" +
@@ -55,8 +68,9 @@ else
 
 // ── Environment bootstrap ─────────────────────────────────────────────────────
 
-string  podmanEnv   = "";
-bool    podmanReady = false;
+string  podmanEnv       = "";
+string  containerName   = "";
+bool    podmanReady     = false;
 
 if (issueReport == null)
 {
@@ -73,7 +87,8 @@ if (issueReport == null)
     {
         Console.Error.WriteLine("[WslContainerMcp] WSL is available. Bootstrapping Podman...");
         string? bootstrapIssue;
-        (podmanReady, podmanEnv, bootstrapIssue) = await PodmanBootstrap.RunAsync(containerDirWin);
+        (podmanReady, podmanEnv, containerName, bootstrapIssue) =
+            await PodmanBootstrap.RunAsync(containerDirWin, linuxContainerWin, allowNetwork);
         if (!podmanReady)
         {
             issueReport = bootstrapIssue
@@ -91,13 +106,14 @@ if (issueReport == null)
 
 var bootstrap = new BootstrapResult
 {
-    PodmanReady     = podmanReady,
-    PodmanEnv       = podmanEnv,
-    IssueReport     = issueReport,
-    WorkspaceWin    = workspaceWin,
-    OutWin          = outWin,
-    ContainerDirWin = containerDirWin,
-    AllowNetwork    = allowNetwork,
+    PodmanReady             = podmanReady,
+    PodmanEnv               = podmanEnv,
+    IssueReport             = issueReport,
+    LinuxContainerWin       = linuxContainerWin,
+    OutWin                  = outWin,
+    ContainerDirWin         = containerDirWin,
+    PersistentContainerName = containerName,
+    AllowNetwork            = allowNetwork,
 };
 
 var builder = Host.CreateApplicationBuilder(args);

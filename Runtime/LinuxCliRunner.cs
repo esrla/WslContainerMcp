@@ -8,9 +8,27 @@ using System.Threading.Tasks;
 
 namespace WslContainerMcp.Runtime;
 
-/// <summary>Implements the <c>run_linux_cli</c> MCP tool: creates a container, runs a command,
-/// writes a meta JSON, and removes the container. Files written to /workspace inside the
-/// container are directly accessible from Windows via the mounted workspace directory.</summary>
+/// <summary>
+/// Implements the <c>run_linux_cli</c> MCP tool: executes a command inside the persistent
+/// Linux container via <c>podman exec</c> and returns stdout, stderr, and exit code.
+/// <para>
+/// The persistent container (<c>wsl-sandbox-mcp-persistent</c>) survives across tool
+/// invocations — installed software, running processes, and filesystem state are preserved
+/// exactly as on a normal Linux machine. The agent does not need to know it is in a container.
+/// </para>
+/// <para>
+/// Files written to <c>/workspace</c> or <c>/home</c> inside the container are directly
+/// accessible from Windows in the <c>linux-container</c> directory
+/// (<c>%USERPROFILE%\.wsl-sandbox-mcp\linux-container\</c>).
+/// </para>
+/// <para>
+/// <b>Long-lived processes:</b> Commands that start background services (e.g. a web server)
+/// will keep running in the container after the <c>podman exec</c> call returns only if they
+/// are daemonised or redirected. Port exposure from the container to the Windows host requires
+/// additional Podman port-forwarding (<c>-p</c>) configured at container creation time, which
+/// is not yet wired up automatically. See <see cref="Runtime.PodmanBootstrap"/> for follow-up.
+/// </para>
+/// </summary>
 internal static class LinuxCliRunner
 {
     private const string ImageName = "wsl-sandbox-mcp-agent:latest";
@@ -33,11 +51,10 @@ internal static class LinuxCliRunner
         int               timeoutRaw,
         Dictionary<string, string> extraEnv,
         string            podmanEnv,
-        bool              allowNetwork,
-        string            workspaceWin,
+        string            persistentContainerName,
         string            outWin,
         CancellationToken ct)
-        => Task.Run(() => Run(toolCallId, cmd, args, cwdRaw, timeoutRaw, extraEnv, podmanEnv, allowNetwork, workspaceWin, outWin), ct);
+        => Task.Run(() => Run(toolCallId, cmd, args, cwdRaw, timeoutRaw, extraEnv, podmanEnv, persistentContainerName, outWin), ct);
 
     private static RunResult Run(
         string toolCallId,
@@ -47,8 +64,7 @@ internal static class LinuxCliRunner
         int timeoutRaw,
         Dictionary<string, string> extraEnv,
         string podmanEnv,
-        bool allowNetwork,
-        string workspaceWin,
+        string persistentContainerName,
         string outWin)
     {
         // ── Validate inputs ───────────────────────────────────────────────────
@@ -59,21 +75,20 @@ internal static class LinuxCliRunner
             return Error("cmd must not contain control characters.");
 
         if (!PathMapping.TrySanitizeCwd(cwdRaw, out var cwd))
-            return Error($"Invalid cwd '{cwdRaw}': must be a relative path with no traversal.");
+            return Error($"Invalid cwd '{cwdRaw}': must be a relative path or absolute Linux path with no traversal.");
 
         var timeout = Math.Clamp(timeoutRaw, 1, 3600);
 
-        // ── Resolve paths ─────────────────────────────────────────────────────
-        var containerName = $"wsl-sandbox-mcp-{toolCallId}";
-        var wslWorkspace  = PathMapping.ToWslPath(workspaceWin);
-        if (string.IsNullOrWhiteSpace(wslWorkspace))
-            return Error("Cannot map workspace path to WSL /mnt/... path.");
+        // ── Resolve working directory ─────────────────────────────────────────
+        // Absolute Linux paths are used as-is; relative paths are resolved
+        // relative to /workspace (backward-compatible default).
+        var workCwd = cwd == "."        ? "/workspace"
+                    : cwd.StartsWith('/') ? cwd
+                    : $"/workspace/{cwd}";
 
-        var workCwd = cwd == "." ? "/workspace" : $"/workspace/{cwd}";
         var metaRel = $"out/{toolCallId}.meta.json";
 
-        // ── Build podman flags ────────────────────────────────────────────────
-        var networkFlag = allowNetwork ? "" : "--network none";
+        // ── Build podman exec flags ───────────────────────────────────────────
         var envFlags = string.Join(" ",
             extraEnv
                 .Where(kv => !string.IsNullOrEmpty(kv.Key) && !kv.Key.Contains('='))
@@ -82,59 +97,47 @@ internal static class LinuxCliRunner
 
         var startedTs = DateTimeOffset.UtcNow;
 
-        // ── 1. podman create ──────────────────────────────────────────────────
-        var createParts = new[]
+        // ── podman exec ───────────────────────────────────────────────────────
+        // Runs the command inside the already-running persistent container.
+        // State (installed packages, files outside /workspace and /home) is
+        // preserved in the container's overlay layer across calls.
+        var execParts = new[]
         {
             podmanEnv,
-            "podman create",
-            $"--name {Q(containerName)}",
-            "--rm=false",
-            networkFlag,
-            $"-v {Q(wslWorkspace + ":/workspace:rw")}",
+            "podman exec",
             $"-w {Q(workCwd)}",
             envFlags,
-            Q(ImageName),
+            Q(persistentContainerName),
             Q(cmd),
             argsStr,
         };
-        var createScript = string.Join(" ", createParts.Where(p => !string.IsNullOrEmpty(p))).Trim();
+        var execScript = string.Join(" ", execParts.Where(p => !string.IsNullOrEmpty(p))).Trim();
 
-        var createResult = ProcessExec.WslSh(createScript, 30);
-        if (createResult.exitCode != 0)
-        {
-            return Error(
-                $"podman create failed (exit {createResult.exitCode}): " +
-                createResult.stderr.Trim());
-        }
+        var execResult = ProcessExec.WslSh(execScript, timeout + 5);
 
-        // ── 2. podman start -a (capture output, honour timeout) ───────────────
-        var startScript = $"{podmanEnv} podman start -a {Q(containerName)}";
-        var startResult = ProcessExec.WslSh(startScript, timeout + 5);
-
-        bool timedOut = startResult.exitCode == -1 &&
-                        startResult.stderr.Contains("Timeout", StringComparison.OrdinalIgnoreCase);
+        bool timedOut = execResult.exitCode == -1 &&
+                        execResult.stderr.Contains("Timeout", StringComparison.OrdinalIgnoreCase);
         if (timedOut)
         {
-            Console.Error.WriteLine($"[LinuxCliRunner] Timeout ({timeout}s) hit for {containerName}; stopping.");
-            ProcessExec.WslSh($"{podmanEnv} podman stop -t 1 {Q(containerName)}", 15);
+            Console.Error.WriteLine($"[LinuxCliRunner] Timeout ({timeout}s) hit; command may still be running inside '{persistentContainerName}'.");
         }
 
         var finishedTs = DateTimeOffset.UtcNow;
 
-        // ── 3. Write meta JSON ────────────────────────────────────────────────
+        // ── Write meta JSON ───────────────────────────────────────────────────
         string? artifactMeta = null;
         try
         {
             var meta = new JsonObject
             {
-                ["image"]       = ImageName,
+                ["container"]   = persistentContainerName,
                 ["cmd"]         = cmd,
                 ["args"]        = new JsonArray(args.Select(a => (JsonNode)JsonValue.Create(a)!).ToArray()),
-                ["cwd"]         = cwd,
+                ["cwd"]         = workCwd,
                 ["env"]         = new JsonObject(
                     extraEnv.Select(kv =>
                         new KeyValuePair<string, JsonNode?>(kv.Key, JsonValue.Create(kv.Value)))),
-                ["exit_code"]   = startResult.exitCode,
+                ["exit_code"]   = execResult.exitCode,
                 ["timed_out"]   = timedOut,
                 ["started_ts"]  = startedTs.ToString("O"),
                 ["finished_ts"] = finishedTs.ToString("O"),
@@ -151,13 +154,10 @@ internal static class LinuxCliRunner
             Console.Error.WriteLine($"[LinuxCliRunner] meta write failed: {ex.Message}");
         }
 
-        // ── 4. podman rm ──────────────────────────────────────────────────────
-        ProcessExec.WslSh($"{podmanEnv} podman rm {Q(containerName)}", 30);
-
         return new RunResult(
-            startResult.exitCode,
-            startResult.stdout,
-            startResult.stderr,
+            execResult.exitCode,
+            execResult.stdout,
+            execResult.stderr,
             timedOut,
             artifactMeta);
     }
@@ -165,4 +165,3 @@ internal static class LinuxCliRunner
     private static RunResult Error(string message) =>
         new RunResult(-1, "", message, false, null);
 }
-
