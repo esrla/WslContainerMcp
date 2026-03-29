@@ -16,6 +16,7 @@ bool allowNetwork = !args.Contains("--no-network", StringComparer.OrdinalIgnoreC
 var userProfile     = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
 var rootWin         = Path.Combine(userProfile, ".wsl-sandbox-mcp");
 var workspaceWin    = Path.Combine(rootWin, "workspace");
+var homeWin         = Path.Combine(rootWin, "home");
 var outWin          = Path.Combine(workspaceWin, "out");
 var containerDirWin = Path.Combine(rootWin, "container");
 
@@ -34,6 +35,7 @@ else
     try
     {
         Directory.CreateDirectory(outWin);
+        Directory.CreateDirectory(homeWin);
         Directory.CreateDirectory(containerDirWin);
 
         // Ensure the agent Dockerfile exists in the runtime container directory.
@@ -95,6 +97,7 @@ var bootstrap = new BootstrapResult
     PodmanEnv       = podmanEnv,
     IssueReport     = issueReport,
     WorkspaceWin    = workspaceWin,
+    HomeWin         = homeWin,
     OutWin          = outWin,
     ContainerDirWin = containerDirWin,
     AllowNetwork    = allowNetwork,

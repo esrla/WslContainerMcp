@@ -7,8 +7,13 @@ public sealed class BootstrapResult
     public string  PodmanEnv       { get; init; } = "";
     public string? IssueReport     { get; init; }
     public string  WorkspaceWin    { get; init; } = "";
+    /// <summary>
+    /// Windows path to the persistent home directory, mounted as <c>/root</c> inside the
+    /// container so the root user's home is directly inspectable from Windows Explorer.
+    /// </summary>
+    public string  HomeWin         { get; init; } = "";
     public string  OutWin          { get; init; } = "";
     public string  ContainerDirWin { get; init; } = "";
-    /// <summary>When false, containers are started with <c>--network none</c>.</summary>
+    /// <summary>When false, the persistent container is created with <c>--network none</c>.</summary>
     public bool    AllowNetwork    { get; init; } = true;
 }
