@@ -7,11 +7,9 @@ using WslContainerMcp;
 using WslContainerMcp.Runtime;
 using WslContainerMcp.Tools;
 
-if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-{
-    Console.Error.WriteLine("[WslContainerMcp] This server requires Windows.");
-    return 1;
-}
+// ── Parse server flags ────────────────────────────────────────────────────────
+
+bool allowNetwork = !args.Contains("--no-network", StringComparer.OrdinalIgnoreCase);
 
 // ── Workspace setup ───────────────────────────────────────────────────────────
 
@@ -21,65 +19,71 @@ var workspaceWin    = Path.Combine(rootWin, "workspace");
 var outWin          = Path.Combine(workspaceWin, "out");
 var containerDirWin = Path.Combine(rootWin, "container");
 
-try
-{
-    Directory.CreateDirectory(outWin);
-    Directory.CreateDirectory(containerDirWin);
+string? issueReport = null;
 
-    // Ensure the agent Dockerfile exists in the runtime container directory.
-    var dfPath = Path.Combine(containerDirWin, "Dockerfile");
-    if (!File.Exists(dfPath))
-        File.WriteAllText(dfPath, AgentDockerfile.Content, new UTF8Encoding(false));
-}
-catch (Exception ex)
+if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
 {
-    Console.Error.WriteLine($"[WslContainerMcp] Failed to create workspace dirs: {ex.Message}");
-    return 1;
+    issueReport =
+        "❌ This server only runs on Windows.\n\n" +
+        "WslContainerMcp requires Windows Subsystem for Linux (WSL) which is a Windows-only feature.\n" +
+        "Please run this server on a Windows 10/11 machine.";
+    Console.Error.WriteLine("[WslContainerMcp] Not running on Windows.");
+}
+else
+{
+    try
+    {
+        Directory.CreateDirectory(outWin);
+        Directory.CreateDirectory(containerDirWin);
+
+        // Ensure the agent Dockerfile exists in the runtime container directory.
+        var dfPath = Path.Combine(containerDirWin, "Dockerfile");
+        if (!File.Exists(dfPath))
+            File.WriteAllText(dfPath, AgentDockerfile.Content, new UTF8Encoding(false));
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"[WslContainerMcp] Failed to create workspace dirs: {ex.Message}");
+        issueReport =
+            "❌ Failed to create the server workspace directories.\n\n" +
+            $"Error: {ex.Message}\n\n" +
+            "To fix:\n" +
+            $"  • Ensure write access to: {rootWin}\n" +
+            "  • Try running the server as the same user who will use it.";
+    }
 }
 
 // ── Environment bootstrap ─────────────────────────────────────────────────────
 
-string? issueReport = null;
 string  podmanEnv   = "";
 bool    podmanReady = false;
 
-if (!WslProbe.IsWslCallable())
+if (issueReport == null)
 {
-    issueReport =
-        "WSL_NOT_AVAILABLE: wsl.exe is not callable or returned a non-zero exit code.\n" +
-        "To fix: install WSL via 'wsl --install' or enable it in Windows Features.\n" +
-        "Reference: https://aka.ms/wslinstall";
-    Console.Error.WriteLine($"[WslContainerMcp] {issueReport}");
-}
-else if (!WslProbe.HasAnyDistro())
-{
-    issueReport =
-        "WSL_NO_DISTRO: WSL is installed but no Linux distribution is registered.\n" +
-        "To fix: run 'wsl --install' or install a distro from the Microsoft Store.";
-    Console.Error.WriteLine($"[WslContainerMcp] {issueReport}");
-}
-else if (!WslProbe.CanRunShell())
-{
-    issueReport =
-        "WSL_SHELL_FAILED: WSL is present but shell execution failed " +
-        "(wsl -e sh -lc \"echo ok\" did not return 'ok').\n" +
-        "To fix: ensure your default WSL distro is healthy ('wsl --status').";
-    Console.Error.WriteLine($"[WslContainerMcp] {issueReport}");
-}
-else
-{
-    Console.Error.WriteLine("[WslContainerMcp] WSL is available. Bootstrapping Podman...");
-    string? bootstrapIssue;
-    (podmanReady, podmanEnv, bootstrapIssue) = await PodmanBootstrap.RunAsync(containerDirWin);
-    if (!podmanReady)
+    // WSL checks — auto-fix where possible, report clearly on failure
+    Console.Error.WriteLine("[WslContainerMcp] Checking WSL...");
+    string? wslIssue;
+    (var wslReady, wslIssue) = await WslBootstrap.EnsureAsync();
+    if (!wslReady)
     {
-        issueReport = bootstrapIssue
-            ?? "PODMAN_NOT_READY: Podman bootstrap failed for an unknown reason. Check stderr.";
-        Console.Error.WriteLine($"[WslContainerMcp] Podman not ready: {issueReport}");
+        issueReport = wslIssue;
+        Console.Error.WriteLine($"[WslContainerMcp] WSL not ready: {issueReport}");
     }
     else
     {
-        Console.Error.WriteLine("[WslContainerMcp] Podman ready. Starting MCP server.");
+        Console.Error.WriteLine("[WslContainerMcp] WSL is available. Bootstrapping Podman...");
+        string? bootstrapIssue;
+        (podmanReady, podmanEnv, bootstrapIssue) = await PodmanBootstrap.RunAsync(containerDirWin);
+        if (!podmanReady)
+        {
+            issueReport = bootstrapIssue
+                ?? "❌ Podman bootstrap failed for an unknown reason. Check the server's error output.";
+            Console.Error.WriteLine($"[WslContainerMcp] Podman not ready: {issueReport}");
+        }
+        else
+        {
+            Console.Error.WriteLine("[WslContainerMcp] Podman ready. Starting MCP server.");
+        }
     }
 }
 
@@ -93,6 +97,7 @@ var bootstrap = new BootstrapResult
     WorkspaceWin    = workspaceWin,
     OutWin          = outWin,
     ContainerDirWin = containerDirWin,
+    AllowNetwork    = allowNetwork,
 };
 
 var builder = Host.CreateApplicationBuilder(args);
@@ -115,3 +120,4 @@ else
 
 await builder.Build().RunAsync();
 return 0;
+

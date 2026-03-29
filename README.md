@@ -1,23 +1,31 @@
 # WslContainerMcp
 
-A Windows-only MCP server that exposes a single tool — **`run_linux_cli`** — allowing any MCP-aware AI agent to run arbitrary commands inside a disposable Podman Linux container inside WSL.
+A Windows-only MCP server that gives any MCP-aware AI agent full access to a Linux container running inside WSL via Podman.
 
 ## How It Works
 
-The server communicates over **stdio** (stdin/stdout) and exposes exactly **one tool** depending on whether the environment is ready:
+The server communicates over **stdio** (stdin/stdout) and always exposes exactly **one tool** depending on whether the environment is ready:
 
-| Environment state                        | Tool exposed                  |
-|------------------------------------------|-------------------------------|
-| WSL available + Podman ready             | `run_linux_cli`               |
-| WSL available, but Podman not yet ready  | `environment_issue_report`    |
+| Environment state               | Tool exposed                  |
+|---------------------------------|-------------------------------|
+| Everything ready                | `run_linux_cli`               |
+| Any issue (WSL, Podman, etc.)   | `environment_issue_report`    |
 
-Calling `environment_issue_report` returns a human-readable diagnosis message so you can fix the issue without leaving your AI chat.
+Calling `environment_issue_report` returns a plain-language description of what went wrong and step-by-step instructions to fix it — so users can resolve issues without leaving their AI chat.
+
+The server attempts to fix problems automatically where possible:
+- **WSL not installed** → tries `wsl --install --no-launch` automatically
+- **No Linux distro** → tries `wsl --install -d Ubuntu --no-launch` automatically
+- **Shell not responding** → tries `wsl --shutdown` and retries automatically
+- **Podman not installed** → installs via `apt-get`/`dnf`/`apk` automatically
+- **Agent image missing** → builds from the embedded Dockerfile automatically
 
 ## Requirements
 
-- **Windows 10/11** (or Windows Server 2019+) with WSL 2 enabled
-- At least one WSL Linux distribution installed (`wsl --install`)
-- **Podman** inside WSL (auto-installed on first run if not present, requires passwordless `sudo`)
+- **Windows 10/11** (WSL 2 must be supported)
+- WSL 2 (installed automatically on first run if missing)
+- A Linux distribution in WSL (Ubuntu is installed automatically if none is present)
+- Podman (installed automatically inside WSL if missing, requires passwordless `sudo`)
 
 ## Quick Start
 
@@ -25,10 +33,16 @@ Calling `environment_issue_report` returns a human-readable diagnosis message so
 # Option A: run directly (requires .NET 10 SDK)
 dotnet run
 
-# Option B: build self-contained exe and run it
+# Option B: publish self-contained exe and run it
 dotnet publish -c Release
 .\bin\Release\net10.0-windows\win-x64\publish\WslContainerMcp.exe
 ```
+
+### Server Flags
+
+| Flag            | Description                                                          |
+|-----------------|----------------------------------------------------------------------|
+| `--no-network`  | Start containers with `--network none` (no internet access)         |
 
 ### Registering with an MCP Client
 
@@ -44,9 +58,22 @@ Add to your MCP client configuration (e.g. Claude Desktop `claude_desktop_config
 }
 ```
 
+To block container internet access:
+
+```json
+{
+  "mcpServers": {
+    "WslContainerMcp": {
+      "command": "C:\\path\\to\\WslContainerMcp.exe",
+      "args": ["--no-network"]
+    }
+  }
+}
+```
+
 ## Tool: `run_linux_cli`
 
-Runs a command inside a fresh `wsl-sandbox-mcp-agent:latest` Podman container and returns the results.
+Runs a command inside a fresh `wsl-sandbox-mcp-agent:latest` Podman container.
 
 ### Input
 
@@ -68,29 +95,36 @@ Runs a command inside a fresh `wsl-sandbox-mcp-agent:latest` Podman container an
 | `stdout`        | `string` | Captured standard output                                    |
 | `stderr`        | `string` | Captured standard error                                     |
 | `timed_out`     | `bool`   | Whether the command was killed due to timeout               |
-| `artifact_tar`  | `string` | Relative path to exported container filesystem tar          |
-| `artifact_meta` | `string` | Relative path to JSON metadata file                         |
+| `artifact_meta` | `string` | Relative path to call metadata JSON (optional)             |
 
-## Workspace Layout (per-user, no cross-user mixing)
+## Workspace & File Access
 
-All data is stored under `%USERPROFILE%\.wsl-sandbox-mcp\`:
+All data is stored under `%USERPROFILE%\.wsl-sandbox-mcp\` (one workspace per Windows user — no cross-user mixing):
 
 ```
 %USERPROFILE%\.wsl-sandbox-mcp\
 ├── workspace\              ← mounted as /workspace inside every container
-│   └── out\                ← artifacts for each tool call
-│       ├── <id>.tar        ← exported container filesystem (Mode B)
-│       └── <id>.meta.json  ← call metadata (cmd, args, exit_code, timestamps…)
+│   └── out\                ← call metadata JSON files
 ├── container\
 │   └── Dockerfile          ← auto-extracted; used to build the agent image
-└── storage.conf            (inside WSL) ← stable Podman storage config (Mode A)
 ```
 
-## Inspecting Container State
+### Inspecting files from inside the container
 
-### Mode A — Stable Podman Storage (inspect via `\\wsl$`)
+The workspace is mounted at `/workspace` inside every container. **Any file written to `/workspace` during a run is immediately visible from Windows** at:
 
-Podman is configured to store images and layers in a stable per-user directory inside WSL:
+```
+%USERPROFILE%\.wsl-sandbox-mcp\workspace\
+```
+
+For example, a command that writes to `/workspace/result.txt` can be read on Windows at:
+```
+%USERPROFILE%\.wsl-sandbox-mcp\workspace\result.txt
+```
+
+### Inspecting Podman image storage (via `\\wsl$`)
+
+Podman stores images and layers in a stable per-user directory inside WSL:
 
 ```
 \\wsl$\<DistroName>\home\<linuxuser>\.wsl-sandbox-mcp\podman\
@@ -98,88 +132,27 @@ Podman is configured to store images and layers in a stable per-user directory i
 └── runroot\     ← runtime state
 ```
 
-Open this path directly in Windows Explorer to inspect the Podman storage at any time.
-
-### Mode B — Full Container Filesystem Export (artifact per call)
-
-After every `run_linux_cli` call, the complete container filesystem is exported as a tar archive:
-
-| Artifact                          | Windows path                                                   |
-|-----------------------------------|----------------------------------------------------------------|
-| Container filesystem              | `%USERPROFILE%\.wsl-sandbox-mcp\workspace\out\<id>.tar`       |
-| Call metadata (JSON)              | `%USERPROFILE%\.wsl-sandbox-mcp\workspace\out\<id>.meta.json` |
-
-The metadata JSON contains: `image`, `cmd`, `args`, `cwd`, `env`, `exit_code`, `timed_out`, `started_ts`, `finished_ts`.
+Open this path directly in Windows Explorer.
 
 ## Project Structure
 
 ```
 WslContainerMcp/
-├── Program.cs                  ← Minimal startup (WSL probe → bootstrap → MCP server)
+├── Program.cs                  ← Minimal startup (WSL/Podman bootstrap → MCP server)
 ├── AgentDockerfile.cs          ← Embedded Dockerfile content (self-contained)
 ├── WslContainerMcp.csproj
 ├── Runtime/
 │   ├── BootstrapResult.cs      ← DI-shared state from startup bootstrap
-│   ├── LinuxCliRunner.cs       ← run_linux_cli core logic + Mode B export
+│   ├── LinuxCliRunner.cs       ← run_linux_cli core logic
 │   ├── PathMapping.cs          ← Windows ↔ WSL path conversion + cwd sanitization
 │   ├── PodmanBootstrap.cs      ← Podman setup: storage config, install, image build
 │   ├── ProcessExec.cs          ← Low-level process/WSL execution helpers
-│   └── WslProbe.cs             ← WSL availability checks
+│   ├── WslBootstrap.cs         ← WSL availability checks + auto-fix attempts
+│   └── WslProbe.cs             ← Low-level WSL probes (no side effects)
 ├── Tools/
 │   ├── RunLinuxCliTool.cs      ← MCP tool: run_linux_cli
 │   └── EnvironmentIssueReportTool.cs ← MCP tool: environment_issue_report (fallback)
 └── Container/
     └── Dockerfile              ← Source for wsl-sandbox-mcp-agent:latest
-```
-
-## Troubleshooting
-
-### `WSL_NOT_AVAILABLE` – wsl.exe not found or not callable
-
-Enable WSL in Windows Features and restart, or run:
-```powershell
-wsl --install
-```
-
-### `WSL_NO_DISTRO` – no Linux distribution registered
-
-Install a distro:
-```powershell
-wsl --install -d Ubuntu
-```
-
-### `WSL_SHELL_FAILED` – shell execution failed
-
-Check the health of your default distro:
-```powershell
-wsl --status
-wsl -e sh -lc "echo ok"
-```
-
-### `SUDO_NOT_NONINTERACTIVE` – can't install Podman automatically
-
-Configure passwordless sudo inside WSL or install Podman manually:
-```bash
-sudo apt-get install -y podman
-```
-
-### `PODMAN_INFO_FAILED` – Podman installed but not functional
-
-This usually means a missing kernel feature (cgroups v2) or user-namespace issue.
-Check inside WSL:
-```bash
-podman info
-```
-Ensure your WSL distro is Ubuntu 22.04+ or another distro with cgroups v2 support.
-
-### `IMAGE_BUILD_FAILED` – container image build failed
-
-Check the Dockerfile at:
-```
-%USERPROFILE%\.wsl-sandbox-mcp\container\Dockerfile
-```
-And run manually inside WSL:
-```bash
-podman build -t wsl-sandbox-mcp-agent:latest <path-to-dockerfile-dir>
 ```
 

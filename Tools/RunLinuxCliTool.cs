@@ -12,7 +12,9 @@ namespace WslContainerMcp.Tools;
 
 /// <summary>
 /// MCP tool that runs a command inside a disposable Podman Linux container
-/// and returns stdout, stderr, exit code, and artifact paths (Mode B).
+/// and returns stdout, stderr, and exit code.
+/// Files written to /workspace inside the container are directly accessible
+/// from Windows at %USERPROFILE%\.wsl-sandbox-mcp\workspace\.
 /// </summary>
 [McpServerToolType]
 public sealed class RunLinuxCliTool(BootstrapResult bootstrap)
@@ -22,8 +24,9 @@ public sealed class RunLinuxCliTool(BootstrapResult bootstrap)
     [McpServerTool(Name = "run_linux_cli")]
     [Description(
         "Run a command inside a disposable Podman Linux container (wsl-sandbox-mcp-agent:latest). " +
-        "Returns stdout, stderr, exit_code, and paths to the exported container filesystem tar " +
-        "and a metadata JSON (Mode B artifacts).")]
+        "Returns stdout, stderr, and exit_code. " +
+        "Files written to /workspace inside the container are directly accessible from Windows at " +
+        "%USERPROFILE%\\.wsl-sandbox-mcp\\workspace\\.")]
     public async Task<string> RunAsync(
         [Description("Executable to run inside the container (e.g. \"python3\", \"bash\").")]
         string cmd,
@@ -54,6 +57,7 @@ public sealed class RunLinuxCliTool(BootstrapResult bootstrap)
             timeout_s,
             extraEnv,
             bootstrap.PodmanEnv,
+            bootstrap.AllowNetwork,
             bootstrap.WorkspaceWin,
             bootstrap.OutWin,
             cancellationToken).ConfigureAwait(false);
@@ -65,9 +69,9 @@ public sealed class RunLinuxCliTool(BootstrapResult bootstrap)
             ["stderr"]    = result.Stderr,
             ["timed_out"] = result.TimedOut,
         };
-        if (result.ArtifactTar  != null) output["artifact_tar"]  = result.ArtifactTar;
         if (result.ArtifactMeta != null) output["artifact_meta"] = result.ArtifactMeta;
 
         return output.ToJsonString(IndentedJson);
     }
 }
+

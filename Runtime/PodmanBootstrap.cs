@@ -24,8 +24,14 @@ internal static class PodmanBootstrap
             var home = ProcessExec.WslSh("echo $HOME", 10).stdout.Trim();
             if (string.IsNullOrWhiteSpace(home))
             {
-                const string msg = "BOOTSTRAP_HOME_MISSING: Could not resolve $HOME inside WSL. " +
-                                   "Ensure your WSL distro has a properly configured user home directory.";
+                const string msg =
+                    "❌ Could not resolve $HOME inside WSL.\n\n" +
+                    "This usually means the WSL distro does not have a user home directory configured.\n\n" +
+                    "To fix:\n" +
+                    "  1. Open a terminal and run: wsl\n" +
+                    "  2. If prompted to create a user, do so.\n" +
+                    "  3. Verify your home directory: echo $HOME\n" +
+                    "  4. Start this server again.";
                 Console.Error.WriteLine($"[Bootstrap] {msg}");
                 return (false, "", msg);
             }
@@ -40,8 +46,12 @@ internal static class PodmanBootstrap
                 $"mkdir -p {Q(baseDir)} {Q(graphRoot)} {Q(runRoot)}", 30);
             if (mkdirs.exitCode != 0)
             {
-                var msg = "BOOTSTRAP_MKDIR_FAILED: Could not create required directories inside WSL.\n" +
-                          $"Details: {mkdirs.stderr.Trim()}";
+                var msg =
+                    "❌ Could not create required directories inside WSL.\n\n" +
+                    $"Details: {mkdirs.stderr.Trim()}\n\n" +
+                    "To fix:\n" +
+                    $"  1. Open a WSL terminal and run: mkdir -p {baseDir}/podman/graphroot {baseDir}/podman/runroot\n" +
+                    "  2. Start this server again.";
                 Console.Error.WriteLine($"[Bootstrap] {msg}");
                 return (false, "", msg);
             }
@@ -55,8 +65,12 @@ internal static class PodmanBootstrap
 
             if (!WriteToWsl(storageConf, confContent))
             {
-                const string msg = "BOOTSTRAP_STORAGE_CONF_FAILED: Failed to write storage.conf inside WSL. " +
-                                   "Ensure python3 or base64 is available in your WSL distro.";
+                const string msg =
+                    "❌ Failed to write the Podman storage configuration inside WSL.\n\n" +
+                    "This usually means 'base64' is not available in the WSL distro.\n\n" +
+                    "To fix:\n" +
+                    "  1. Open a WSL terminal and run: sudo apt-get install -y coreutils\n" +
+                    "  2. Start this server again.";
                 Console.Error.WriteLine($"[Bootstrap] {msg}");
                 return (false, "", msg);
             }
@@ -66,7 +80,7 @@ internal static class PodmanBootstrap
             // 4. Verify or install Podman
             if (!CommandExistsInWsl("podman"))
             {
-                Console.Error.WriteLine("[Bootstrap] podman not found; attempting non-interactive install...");
+                Console.Error.WriteLine("[Bootstrap] Podman not found; attempting non-interactive install...");
                 if (!TryInstallPodman(out var installMsg))
                 {
                     Console.Error.WriteLine($"[Bootstrap] Podman install failed: {installMsg}");
@@ -76,8 +90,13 @@ internal static class PodmanBootstrap
 
             if (ProcessExec.WslSh($"{podmanEnv} podman --version", 10).exitCode != 0)
             {
-                const string msg = "PODMAN_VERSION_FAILED: 'podman --version' failed inside WSL. " +
-                                   "Podman may be installed but not functional. Try running it manually.";
+                const string msg =
+                    "❌ Podman is installed but 'podman --version' failed.\n\n" +
+                    "Podman may be installed but not functional.\n\n" +
+                    "To fix:\n" +
+                    "  1. Open a WSL terminal and run: podman --version\n" +
+                    "  2. If it fails, try reinstalling: sudo apt-get install --reinstall podman\n" +
+                    "  3. Start this server again.";
                 Console.Error.WriteLine($"[Bootstrap] {msg}");
                 return (false, podmanEnv, msg);
             }
@@ -85,9 +104,15 @@ internal static class PodmanBootstrap
             var podmanInfo = ProcessExec.WslSh($"{podmanEnv} podman info", 30);
             if (podmanInfo.exitCode != 0)
             {
-                var msg = "PODMAN_INFO_FAILED: 'podman info' failed inside WSL. " +
-                          "This often indicates a missing kernel feature (e.g. cgroups v2) or user namespace issue.\n" +
-                          $"Details: {podmanInfo.stderr.Trim()}";
+                var msg =
+                    "❌ Podman is installed but 'podman info' failed.\n\n" +
+                    "This usually means a missing kernel feature (cgroups v2) or a user namespace issue.\n\n" +
+                    $"Error details: {podmanInfo.stderr.Trim()}\n\n" +
+                    "To fix:\n" +
+                    "  1. Ensure your WSL distro is Ubuntu 22.04+ or another distro with cgroups v2.\n" +
+                    "  2. Open a WSL terminal and run: podman info\n" +
+                    "  3. If you see 'cgroup' errors, update your WSL kernel: wsl --update\n" +
+                    "  4. Start this server again.";
                 Console.Error.WriteLine($"[Bootstrap] {msg}");
                 return (false, podmanEnv, msg);
             }
@@ -103,8 +128,14 @@ internal static class PodmanBootstrap
                 }
                 if (ProcessExec.WslSh($"{podmanEnv} podman image exists {Q(ImageName)}", 10).exitCode != 0)
                 {
-                    const string msg = "IMAGE_STILL_MISSING: Image build appeared to succeed but " +
-                                       $"'{ImageName}' is still not listed by Podman. Check your Podman storage config.";
+                    var msg =
+                        $"❌ The container image '{ImageName}' was not found after a successful build.\n\n" +
+                        "This may indicate a Podman storage configuration issue.\n\n" +
+                        "To fix:\n" +
+                        "  1. Open a WSL terminal and run: podman images\n" +
+                        "  2. Check that the Podman storage configuration is correct:\n" +
+                        $"     cat ~/.wsl-sandbox-mcp/storage.conf\n" +
+                        "  3. Start this server again.";
                     Console.Error.WriteLine($"[Bootstrap] {msg}");
                     return (false, podmanEnv, msg);
                 }
@@ -116,7 +147,10 @@ internal static class PodmanBootstrap
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[Bootstrap] Exception: {ex.Message}");
-            var exMsg = $"BOOTSTRAP_EXCEPTION: Unexpected error during bootstrap: {ex.Message}";
+            var exMsg =
+                "❌ An unexpected error occurred during environment setup.\n\n" +
+                $"Error: {ex.Message}\n\n" +
+                "Please check the server's error output for details and try starting again.";
             return (false, "", exMsg);
         }
     }
@@ -128,9 +162,16 @@ internal static class PodmanBootstrap
     {
         if (ProcessExec.WslSh("sudo -n true", 10).exitCode != 0)
         {
-            issueMsg = "SUDO_NOT_NONINTERACTIVE: 'sudo -n true' failed inside WSL. " +
-                       "Podman is not installed and it cannot be installed non-interactively without passwordless sudo. " +
-                       "Either install Podman manually ('sudo apt-get install -y podman') or configure passwordless sudo.";
+            issueMsg =
+                "❌ Podman is not installed and cannot be installed automatically.\n\n" +
+                "Automatic installation requires passwordless sudo, which is not configured.\n\n" +
+                "To fix:\n" +
+                "  Option A — Install Podman manually:\n" +
+                "    1. Open a WSL terminal and run: sudo apt-get install -y podman\n" +
+                "    2. Start this server again.\n\n" +
+                "  Option B — Enable passwordless sudo, then restart this server:\n" +
+                "    1. Open a WSL terminal and run: sudo visudo\n" +
+                "    2. Add the line: <username> ALL=(ALL) NOPASSWD: ALL";
             Console.Error.WriteLine($"[Bootstrap] {issueMsg}");
             return false;
         }
@@ -138,12 +179,19 @@ internal static class PodmanBootstrap
         var pm = DetectPackageManager();
         if (string.IsNullOrEmpty(pm))
         {
-            issueMsg = "PKG_MANAGER_MISSING: No supported package manager found (apt-get / dnf / apk) inside WSL. " +
-                       "Install Podman manually and restart the server.";
+            issueMsg =
+                "❌ Podman is not installed and no supported package manager was found.\n\n" +
+                "Looked for: apt-get, dnf, apk\n\n" +
+                "To fix:\n" +
+                "  1. Open a WSL terminal.\n" +
+                "  2. Install Podman using your distro's package manager.\n" +
+                "  3. Verify: podman --version\n" +
+                "  4. Start this server again.";
             Console.Error.WriteLine($"[Bootstrap] {issueMsg}");
             return false;
         }
 
+        Console.Error.WriteLine($"[Bootstrap] Installing Podman via {pm}...");
         (int exitCode, string stdout, string stderr) result = pm switch
         {
             "apt-get" => InstallWithApt("podman"),
@@ -154,10 +202,19 @@ internal static class PodmanBootstrap
 
         if (result.exitCode != 0)
         {
-            issueMsg = $"PODMAN_INSTALL_FAILED: Package installation of Podman failed via {pm}.\n" +
-                       $"Details: {result.stderr?.Trim()}\n" +
-                       "Try installing Podman manually inside WSL and then restart the server.";
-            Console.Error.WriteLine($"[Bootstrap] Package install failed: {result.stderr?.Trim()}");
+            issueMsg =
+                $"❌ Automatic Podman installation via {pm} failed.\n\n" +
+                $"Error details: {result.stderr?.Trim()}\n\n" +
+                "To fix:\n" +
+                "  1. Open a WSL terminal.\n" +
+                (pm == "apt-get"
+                    ? "  2. Run: sudo apt-get update && sudo apt-get install -y podman\n"
+                    : pm == "dnf"
+                    ? "  2. Run: sudo dnf install -y podman\n"
+                    : "  2. Run: sudo apk add podman\n") +
+                "  3. Verify: podman --version\n" +
+                "  4. Start this server again.";
+            Console.Error.WriteLine($"[Bootstrap] {issueMsg}");
             return false;
         }
 
@@ -185,17 +242,29 @@ internal static class PodmanBootstrap
         var wslPath = PathMapping.ToWslPath(containerDirWin);
         if (string.IsNullOrWhiteSpace(wslPath))
         {
-            issueMsg = "IMAGE_PATH_FAILED: Cannot map the container directory to a WSL /mnt/... path. " +
-                       "Ensure the workspace is on a drive letter path (e.g. C:\\...).";
-            Console.Error.WriteLine($"[Bootstrap] {issueMsg}");
+            issueMsg =
+                "❌ Cannot map the container directory to a WSL /mnt/... path.\n\n" +
+                "This usually means the workspace is not on a drive-letter path.\n\n" +
+                "To fix:\n" +
+                "  • Ensure this server is run from a standard Windows drive (e.g. C:\\, D:\\).\n" +
+                "  • UNC paths (\\\\server\\share\\) are not supported.";
+            Console.Error.WriteLine($"[Bootstrap] Path mapping failed: {containerDirWin}");
             return false;
         }
+
+        Console.Error.WriteLine($"[Bootstrap] Building {ImageName} from {containerDirWin}...");
         var r = ProcessExec.WslSh($"{podmanEnv} podman build -t {Q(ImageName)} {Q(wslPath)}", 900);
         if (r.exitCode != 0)
         {
-            issueMsg = $"IMAGE_BUILD_FAILED: 'podman build' for {ImageName} failed.\n" +
-                       $"Details: {r.stderr?.Trim()}\n" +
-                       $"Check the Dockerfile at: {containerDirWin}";
+            issueMsg =
+                $"❌ Building the container image '{ImageName}' failed.\n\n" +
+                $"Error details: {r.stderr?.Trim()}\n\n" +
+                "To fix:\n" +
+                $"  1. Check the Dockerfile at: {containerDirWin}\n" +
+                "  2. Open a WSL terminal and run:\n" +
+                $"     podman build -t {ImageName} {wslPath}\n" +
+                "  3. Ensure the WSL distro has internet access for downloading packages.\n" +
+                "  4. Start this server again.";
             Console.Error.WriteLine($"[Bootstrap] Build error: {r.stderr?.Trim()}");
             return false;
         }
@@ -214,3 +283,4 @@ internal static class PodmanBootstrap
         return ProcessExec.WslSh(script, 30).exitCode == 0;
     }
 }
+

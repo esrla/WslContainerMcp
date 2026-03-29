@@ -9,4 +9,6 @@ public sealed class BootstrapResult
     public string  WorkspaceWin    { get; init; } = "";
     public string  OutWin          { get; init; } = "";
     public string  ContainerDirWin { get; init; } = "";
+    /// <summary>When false, containers are started with <c>--network none</c>.</summary>
+    public bool    AllowNetwork    { get; init; } = true;
 }
